@@ -43,7 +43,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -128,29 +127,36 @@ const cmPerfName = "CmPerf"
 // Poller is the instance that starts and monitors a
 // group of collectors and exporters as a single UNIX process
 type Poller struct {
-	name                 string
-	target               string
-	options              *options.Options
-	schedule             *schedule.Schedule
-	collectors           []collector.Collector
-	exporters            []exporter.Exporter
-	exporterParams       map[string]conf.Exporter
-	params               *conf.Poller
-	metadata             *matrix.Matrix
-	metadataTarget       *matrix.Matrix   // exported as metadata_target_
-	status               *matrix.Matrix   // exported as poller_status
-	pingMetricTarget     *matrix.Metric   // "ping" metric on metadataTarget, resolved once at Init
-	metadataHostInstance *matrix.Instance // "host" instance on metadataTarget, resolved once at Init
-	memoryPercentMetric  *matrix.Metric   // "memory_percent" metric on status, resolved once at Init
-	statusHostInstance   *matrix.Instance // "host" instance on status, resolved once at Init
-	certPool             *x509.CertPool
-	client               *http.Client
-	auth                 *auth.Credentials
-	hasPromExporter      bool
-	maxRssBytes          uint64
-	startTime            time.Time
-	remote               conf.Remote
+	name            string
+	target          string
+	options         *options.Options
+	schedule        *schedule.Schedule
+	collectors      []collector.Collector
+	exporters       []exporter.Exporter
+	exporterParams  map[string]conf.Exporter
+	params          *conf.Poller
+	metadata        *matrix.Matrix // template, exported as metadata_component
+	metadataTarget  *matrix.Matrix // template, exported as metadata_target_
+	status          *matrix.Matrix // template, exported as poller_status
+	certPool        *x509.CertPool
+	client          *http.Client
+	auth            *auth.Credentials
+	hasPromExporter bool
+	maxRssBytes     uint64
+	startTime       time.Time
+	remote          conf.Remote
+
 	concurrentCollectors *atomic.Int32 // tracks the number of currently active collector tasks
+
+	// published is the latest fully-built generation. Each generation is immutable:
+	// the next one is built from independent clones and never mutates a published one.
+	published atomic.Pointer[snapshot]
+
+	// lastCollected/lastExported are the cumulative producer totals captured at the
+	// previous generation. Per-generation counts are the deltas, so each produced
+	// count is attributed to exactly one generation.
+	lastCollected map[string]uint64
+	lastExported  map[string]uint64
 }
 
 // Init starts Poller, reads parameters, opens zeroLog handler, initializes metadata,
@@ -305,6 +311,8 @@ func (p *Poller) Init() error {
 	// initialize our metadata, the metadata will host the status of our
 	// collectors and exporters, as well as ping stats to target host
 	p.loadMetadata()
+	p.lastCollected = make(map[string]uint64)
+	p.lastExported = make(map[string]uint64)
 	p.exporterParams = conf.Config.Exporters
 
 	// iterate over the list of collectors and initialize them
@@ -498,7 +506,11 @@ func (p *Poller) firstAutoSupport() {
 	if p.collectors == nil {
 		return
 	}
-	if _, err := collector.BuildAndWriteAutoSupport(p.collectors, p.metadataTarget, p.name, p.maxRssBytes); err != nil {
+	gen := p.published.Load()
+	if gen == nil {
+		return
+	}
+	if _, err := collector.BuildAndWriteAutoSupport(p.collectors, gen.asupInput(), p.name, p.maxRssBytes); err != nil {
 		slog.Error(
 			"First autosupport failed",
 			slogx.Err(err),
@@ -508,8 +520,9 @@ func (p *Poller) firstAutoSupport() {
 }
 
 func (p *Poller) startAsup() (map[string]*matrix.Matrix, error) {
-	if p.collectors != nil {
-		if err := collector.SendAutosupport(p.collectors, p.metadataTarget, p.name, p.maxRssBytes); err != nil {
+	gen := p.published.Load()
+	if p.collectors != nil && gen != nil {
+		if err := collector.SendAutosupport(p.collectors, gen.asupInput(), p.name, p.maxRssBytes); err != nil {
 			slog.Error(
 				"Start autosupport failed.",
 				slogx.Err(err),
@@ -571,95 +584,23 @@ func (p *Poller) Run() {
 	upCollectors := 0
 	upExporters := 0
 
+	var seq uint64
+
 	// warm-up ping to avoid cold start effects of first ping
 	_, _ = p.ping()
 
 	for {
 		if task.IsDue() {
 			task.Start()
-			// flush metadata
-			p.metadataTarget.Reset()
-			p.status.Reset()
-			p.metadata.Reset()
 
-			// ping target system
-			if ping, ok := p.ping(); ok {
-				p.metadataTarget.MustSetValueUint8("status", p.metadataHostInstance, 0)
-				p.pingMetricTarget.SetValueFloat64(p.metadataHostInstance, float64(ping))
-				p.status.MustSetValueUint8("status", p.statusHostInstance, 1)
-			} else {
-				p.metadataTarget.MustSetValueUint8("status", p.metadataHostInstance, 1)
-				p.status.MustSetValueUint8("status", p.statusHostInstance, 0)
-			}
+			// build the next generation as independent matrices. Nothing here touches
+			// a previously published generation and no exporter is invoked until the
+			// generation is complete.
+			seq++
+			gen, upc, upe := p.buildSnapshot(seq)
 
-			p.addMemoryMetadata()
-
-			// add number of goroutines to metadata
-			p.metadataTarget.MustSetValueInt64("goroutines", p.metadataHostInstance, int64(runtime.NumGoroutine()))
-
-			upc := 0 // up collectors
-			upe := 0 // up exporters
-
-			// update status of collectors
-			for _, c := range p.collectors {
-				code, _, msg := c.GetStatus()
-
-				if code == 0 {
-					upc++
-				}
-
-				key := c.GetName() + "." + c.GetObject()
-
-				collectorInst := p.metadata.MustGetInstance(key)
-				p.metadata.MustSetValueUint64("count", collectorInst, c.GetCollectCount())
-				p.metadata.MustSetValueUint8("status", collectorInst, code)
-
-				if msg != "" {
-					collectorInst.SetLabel("reason", p.truncateReason(msg))
-				}
-			}
-
-			// add remote version and name to metadata
-			p.status.GetInstance("remote").SetLabel("version", p.remote.Version)
-			p.status.GetInstance("remote").SetLabel("name", p.remote.Name)
-
-			// update status of exporters
-			for _, ee := range p.exporters {
-				code, status, msg := ee.GetStatus()
-				logger.Debug(
-					"exporter status",
-					slog.String("name", ee.GetName()),
-					slog.Int("code", int(code)),
-					slog.String("status", status),
-					slog.String("msg", msg),
-				)
-
-				if code == 0 {
-					upe++
-				}
-
-				key := ee.GetClass() + "." + ee.GetName()
-
-				exporterInst := p.metadata.MustGetInstance(key)
-				p.metadata.MustSetValueUint64("count", exporterInst, ee.GetExportCount())
-				p.metadata.MustSetValueUint8("status", exporterInst, code)
-
-				if msg != "" {
-					exporterInst.SetLabel("reason", p.truncateReason(msg))
-				}
-			}
-
-			for _, ee := range p.exporters {
-				if _, err := ee.Export(p.metadata); err != nil {
-					logger.Error("export component metadata", slogx.Err(err))
-				}
-				if _, err := ee.Export(p.metadataTarget); err != nil {
-					logger.Error("export target metadata", slogx.Err(err))
-				}
-				if _, err := ee.Export(p.status); err != nil {
-					logger.Error("export poller status", slogx.Err(err))
-				}
-			}
+			// publish atomically, after this all consumers see the same complete generation
+			p.published.Store(gen)
 
 			// only log when there are changes, which we expect to be infrequent
 			if upc != upCollectors || upe != upExporters {
@@ -677,6 +618,10 @@ func (p *Poller) Run() {
 			}
 			upCollectors = upc
 			upExporters = upe
+
+			// each exporter receives its own copies, so a failure or mutation by one
+			// cannot pollute the published generation, another exporter or AutoSupport
+			p.deliverToExporters(gen)
 		}
 
 		// asup task will be nil when autosupport is disabled
@@ -1361,13 +1306,13 @@ func (p *Poller) loadMetadata() {
 	// metadata for the target system
 	p.metadataTarget = matrix.New("poller", "metadata_target", "metadata_component")
 	_, _ = p.metadataTarget.NewMetricUint8("status")
-	p.pingMetricTarget, _ = p.metadataTarget.NewMetricFloat64("ping")
+	_, _ = p.metadataTarget.NewMetricFloat64("ping")
 	_, _ = p.metadataTarget.NewMetricUint64("goroutines")
 
 	// metadata for the poller itself
 	p.status = matrix.New("poller", "poller", "poller_target")
 	_, _ = p.status.NewMetricUint8("status")
-	p.memoryPercentMetric, _ = p.status.NewMetricFloat64("memory_percent")
+	_, _ = p.status.NewMetricFloat64("memory_percent")
 	newMemoryMetric(p.status, "memory", "rss")
 	newMemoryMetric(p.status, "memory", "vms")
 	newMemoryMetric(p.status, "memory", "swap")
@@ -1375,8 +1320,6 @@ func (p *Poller) loadMetadata() {
 
 	instance, _ := p.metadataTarget.NewInstance("host")
 	pInstance, _ := p.status.NewInstance("host")
-	p.metadataHostInstance = instance
-	p.statusHostInstance = pInstance
 	pRemote, _ := p.status.NewInstance("remote")
 	pRemote.SetExportable(false)
 
@@ -1819,20 +1762,18 @@ func (p *Poller) mergeConfPath() {
 	p.options.SetConfPath(path)
 }
 
-func (p *Poller) addMemoryMetadata() {
+func (p *Poller) addMemoryMetadata(m *matrix.Matrix, host *matrix.Instance) {
 
 	memMetrics := collector.MemoryMetrics()
 
 	// The unix poller used KB for memory so use the same here
-	p.status.MustSetValueUint64("memory.rss", p.statusHostInstance, memMetrics.RSSBytes/1024)
-	p.status.MustSetValueUint64("memory.vms", p.statusHostInstance, memMetrics.VMSBytes/1024)
-	p.status.MustSetValueUint64("memory.swap", p.statusHostInstance, memMetrics.SwapBytes/1024)
-	p.memoryPercentMetric.SetValueFloat64(p.statusHostInstance, memMetrics.PercentageRssUsed)
+	m.MustSetValueUint64("memory.rss", host, memMetrics.RSSBytes/1024)
+	m.MustSetValueUint64("memory.vms", host, memMetrics.VMSBytes/1024)
+	m.MustSetValueUint64("memory.swap", host, memMetrics.SwapBytes/1024)
+	m.MustSetValueFloat64("memory_percent", host, memMetrics.PercentageRssUsed)
 	// Use MustSetValueInt64 and do not use MustAddValueInt64. This metric shows the
-	// number of collectors that are active now. MustAddValueInt64 gives the same result
-	// today, because the poll loop calls p.status.Reset() first. Reset() makes new values.
-	// Do not depend on this behavior.
-	p.status.MustSetValueInt64("concurrent_collectors", p.statusHostInstance, int64(p.concurrentCollectors.Load()))
+	// number of collectors that are active now.
+	m.MustSetValueInt64("concurrent_collectors", host, int64(p.concurrentCollectors.Load()))
 
 	// Update maxRssBytes
 	p.maxRssBytes = max(p.maxRssBytes, memMetrics.RSSBytes)
@@ -1844,8 +1785,12 @@ func (p *Poller) logPollerMetadata() (map[string]*matrix.Matrix, error) {
 		slog.Error("Failed to send Harvest version", slogx.Err(err))
 	}
 
-	remoteName := p.status.GetInstance("remote").GetLabel("name")
-	remoteVersion := p.status.GetInstance("remote").GetLabel("version")
+	var remoteName, remoteVersion string
+	if gen := p.published.Load(); gen != nil {
+		remote := gen.status.GetInstance("remote")
+		remoteName = remote.GetLabel("name")
+		remoteVersion = remote.GetLabel("version")
+	}
 
 	memMetrics := collector.MemoryMetrics()
 	p.maxRssBytes = max(p.maxRssBytes, memMetrics.RSSBytes)

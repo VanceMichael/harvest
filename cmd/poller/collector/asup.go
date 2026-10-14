@@ -35,6 +35,25 @@ type Payload struct {
 	Tenants    *InstanceInfo `json:"Tenants,omitempty"`
 	Collectors *[]AsupCollector
 	path       string
+
+	// metadata maps "Name.Object" to the collector metadata matrix from the same
+	// published generation. CollectAutoSupport implementations read this instead
+	// of the live metadata matrix.
+	metadata map[string]*matrix.Matrix
+}
+
+// CollectorMetadata returns the snapshot metadata matrix for the collector key
+func (p *Payload) CollectorMetadata(key string) *matrix.Matrix {
+	return p.metadata[key]
+}
+
+// Snapshot references the immutable generation data consumed when building
+// AutoSupport: the target metadata matrix and each collector's metadata matrix.
+// AutoSupport therefore sees exactly the same generation as the regular exporters,
+// even when the two overlap.
+type Snapshot struct {
+	Target            *matrix.Matrix
+	CollectorMetadata map[string]*matrix.Matrix
 }
 
 type TargetInfo struct {
@@ -64,8 +83,12 @@ type InstanceInfo struct {
 // InstanceInfoFromMetadata builds an InstanceInfo from the "data" task instance of a
 // collector's metadata matrix, as recorded during PollData. The metrics and the "data"
 // instance are registered unconditionally during collector Init, so it's safe to use
-// MustGetMetric/MustGetInstance here.
+// MustGetMetric/MustGetInstance here. A nil md (collector not initialized) yields a
+// zero InstanceInfo.
 func InstanceInfoFromMetadata(md *matrix.Matrix) InstanceInfo {
+	if md == nil {
+		return InstanceInfo{}
+	}
 	instance := md.MustGetInstance("data")
 	count, _ := md.MustGetMetric("instances").GetValueInt64(instance)
 	dataPoints, _ := md.MustGetMetric("metrics").GetValueInt64(instance)
@@ -155,14 +178,14 @@ func (p *Payload) AddCollectorAsup(a AsupCollector) {
 	*p.Collectors = append(*p.Collectors, a)
 }
 
-func SendAutosupport(collectors []Collector, status *matrix.Matrix, pollerName string, maxRss uint64) error {
+func SendAutosupport(collectors []Collector, snap *Snapshot, pollerName string, maxRss uint64) error {
 
 	var (
 		msg *Payload
 		err error
 	)
 
-	if msg, err = BuildAndWriteAutoSupport(collectors, status, pollerName, maxRss); err != nil {
+	if msg, err = BuildAndWriteAutoSupport(collectors, snap, pollerName, maxRss); err != nil {
 		return fmt.Errorf("failed to build ASUP message poller:%s %w", pollerName, err)
 	}
 
@@ -220,7 +243,7 @@ func sendAsupVia(msg *Payload, asupExecPath string) error {
 	return nil
 }
 
-func BuildAndWriteAutoSupport(collectors []Collector, status *matrix.Matrix, pollerName string, maxRss uint64) (*Payload, error) {
+func BuildAndWriteAutoSupport(collectors []Collector, snap *Snapshot, pollerName string, maxRss uint64) (*Payload, error) {
 
 	var (
 		msg          *Payload
@@ -234,7 +257,7 @@ func BuildAndWriteAutoSupport(collectors []Collector, status *matrix.Matrix, pol
 	arch, cpus = getCPUInfo()
 	// "ping" and "host" are registered unconditionally during poller Init, so it's safe
 	// to use MustGetMetric/MustGetInstance here.
-	ping, _ := status.MustGetMetric("ping").GetValueFloat64(status.MustGetInstance("host"))
+	ping, _ := snap.Target.MustGetMetric("ping").GetValueFloat64(snap.Target.MustGetInstance("host"))
 	msg = &Payload{
 		Platform: &platformInfo{
 			Arch: arch,
@@ -244,6 +267,7 @@ func BuildAndWriteAutoSupport(collectors []Collector, status *matrix.Matrix, pol
 		Target: &TargetInfo{
 			Ping: ping,
 		},
+		metadata: snap.CollectorMetadata,
 	}
 	attachMemory(msg)
 

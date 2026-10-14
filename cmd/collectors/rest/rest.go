@@ -833,8 +833,8 @@ func (r *Rest) CollectAutoSupport(p *collector.Payload) {
 		}
 	}
 
-	// Add collector information
-	md := r.GetMetadata()
+	// Add collector information from the same published generation
+	md := p.CollectorMetadata(r.Name + "." + r.Object)
 	info := collector.InstanceInfoFromMetadata(md)
 
 	p.AddCollectorAsup(collector.AsupCollector{

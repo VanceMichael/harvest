@@ -465,8 +465,8 @@ func (z *Zapi) CollectAutoSupport(p *collector.Payload) {
 		clientTimeout = newTimeout
 	}
 
-	// Add collector information
-	md := z.GetMetadata()
+	// Add collector information from the same published generation
+	md := p.CollectorMetadata(z.Name + "." + z.Object)
 	info := collector.InstanceInfoFromMetadata(md)
 
 	p.AddCollectorAsup(collector.AsupCollector{

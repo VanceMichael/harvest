@@ -59,7 +59,7 @@ type Collector interface {
 	GetLogger() *slog.Logger
 	GetParams() *node.Node
 	GetOptions() *options.Options
-	GetCollectCount() uint64
+	GetCollectedTotal() uint64
 	AddCollectCount(uint64)
 	GetStatus() (uint8, string, string)
 	SetStatus(uint8, string)
@@ -71,6 +71,7 @@ type Collector interface {
 	LoadPlugins(*node.Node, Collector, string) error
 	LoadPlugin(string, *plugin.AbstractPlugin) plugin.Plugin
 	CollectAutoSupport(p *Payload)
+	GetMetadataSnapshot() *matrix.Matrix
 	GetRemote() conf.Remote
 }
 
@@ -96,35 +97,51 @@ type AbstractCollector struct {
 	Name    string           // name of the collector, CamelCased
 	Object  string           // object of the collector, describes what that collector is collecting
 	Logger  *slog.Logger     // logger used for logging
-	Status  uint8            // current state of th
-	Message string           // reason if a collector is in failed state
 	Options *options.Options // poller options
 	Params  *node.Node       // collector parameters
 	// note that this is a merge of poller parameters, collector conf and object conf ("subtemplate")
-	Schedule     *schedule.Schedule         // schedule of the collector
-	Matrix       map[string]*matrix.Matrix  // the data storage of the collector
-	Metadata     *matrix.Matrix             // metadata of the collector, such as poll duration, collected data points etc.
-	Exporters    []exporter.Exporter        // the exporters that the collector will emit data to
-	Plugins      map[string][]plugin.Plugin // built-in or custom plugins
-	collectCount uint64                     // count of collected data points
-	// this is different from what the collector will have in its metadata, since this variable
-	// holds count independent of the poll interval of the collector, used to give stats to Poller
-	countMux *sync.Mutex       // used for atomic access to collectCount
-	Auth     *auth.Credentials // used for authing the collector
-	Remote   conf.Remote
+	Schedule  *schedule.Schedule         // schedule of the collector
+	Matrix    map[string]*matrix.Matrix  // the data storage of the collector
+	Metadata  *matrix.Matrix             // metadata of the collector, such as poll duration, collected data points etc.
+	Exporters []exporter.Exporter        // the exporters that the collector will emit data to
+	Plugins   map[string][]plugin.Plugin // built-in or custom plugins
+
+	// status is the atomically published state: code and reason are read/written as one
+	// value, so a concurrent reader always sees a status code with its matching reason
+	status atomic.Pointer[collectorStatus]
+
+	// collectedTotal is the cumulative number of collected data points since start.
+	// Per-generation deltas are computed by the poller against the previous generation,
+	// so publishing never mutates producer state and each count is attributed exactly once
+	collectedTotal atomic.Uint64
+
+	// metadataSnap is the latest internally-consistent copy of Metadata, published by the
+	// collector itself after each collection cycle completes. Consumers read this copy,
+	// never the live Metadata which may be in the middle of the next collection
+	metadataSnap atomic.Pointer[matrix.Matrix]
+
+	Auth   *auth.Credentials // used for authing the collector
+	Remote conf.Remote
+}
+
+// collectorStatus is the atomically published state of a collector
+type collectorStatus struct {
+	code   uint8
+	reason string
 }
 
 func New(name, object string, o *options.Options, params *node.Node, credentials *auth.Credentials, remote conf.Remote) *AbstractCollector {
-	return &AbstractCollector{
-		Name:     name,
-		Object:   object,
-		Options:  o,
-		Logger:   slog.Default().With(slog.String("collector", name+":"+object)),
-		Params:   params,
-		countMux: &sync.Mutex{},
-		Auth:     credentials,
-		Remote:   remote,
+	c := &AbstractCollector{
+		Name:    name,
+		Object:  object,
+		Options: o,
+		Logger:  slog.Default().With(slog.String("collector", name+":"+object)),
+		Params:  params,
+		Auth:    credentials,
+		Remote:  remote,
 	}
+	c.status.Store(&collectorStatus{})
+	return c
 }
 
 // Init initializes a collector and does the trick of "inheritance",
@@ -286,6 +303,19 @@ func Init(c Collector) error {
 
 func (c *AbstractCollector) GetMetadata() *matrix.Matrix {
 	return c.Metadata
+}
+
+// GetMetadataSnapshot returns the latest published, immutable copy of the
+// collector metadata. Returns nil when the collector has not initialized yet.
+func (c *AbstractCollector) GetMetadataSnapshot() *matrix.Matrix {
+	return c.metadataSnap.Load()
+}
+
+// publishMetadata stores a complete, independent copy of the live metadata as
+// the current snapshot. Only the collector itself calls this, at moments when
+// it is not mutating the matrix, so the clone is never seen half-built.
+func (c *AbstractCollector) publishMetadata() {
+	c.metadataSnap.Store(c.Metadata.Clone())
 }
 
 func (c *AbstractCollector) GetRemote() conf.Remote {
@@ -590,6 +620,11 @@ func (c *AbstractCollector) Start(
 			c.logMetadata("data", exporterStats)
 		}
 
+		// Collection cycle completed without error, publish the now-finished metadata
+		// as the snapshot consumers will read. A failed poll reaches `continue` above
+		// and does not publish, so consumers keep the last complete snapshot.
+		c.publishMetadata()
+
 		if nd := c.Schedule.NextDue(); nd > 0 {
 			c.Schedule.Sleep()
 			// log if lagging by more than 500 ms
@@ -696,37 +731,32 @@ func (c *AbstractCollector) GetObject() string {
 	return c.Object
 }
 
-// GetCollectCount retrieves and resets count of collected data
-// this and next method are only to report the poller
-// how much data we have collected (independent of poll interval)
-func (c *AbstractCollector) GetCollectCount() uint64 {
-	c.countMux.Lock()
-	count := c.collectCount
-	c.collectCount = 0
-	c.countMux.Unlock()
-	return count
+// GetCollectedTotal returns the cumulative count of data points collected since start.
+// The poller derives the per-generation count as the delta against the previous generation,
+// so reading never resets or mutates producer state and each count is attributed exactly once
+func (c *AbstractCollector) GetCollectedTotal() uint64 {
+	return c.collectedTotal.Load()
 }
 
-// AddCollectCount adds n to collectCount atomically
+// AddCollectCount adds n to the cumulative collected count
 func (c *AbstractCollector) AddCollectCount(n uint64) {
-	c.countMux.Lock()
-	c.collectCount += n
-	c.countMux.Unlock()
+	c.collectedTotal.Add(n)
 }
 
-// GetStatus returns current state of the collector
+// GetStatus returns the current state of the collector. The returned code and reason
+// always come from the same atomic state, so they never mismatch.
 func (c *AbstractCollector) GetStatus() (uint8, string, string) {
-	return c.Status, Status[c.Status], c.Message
+	s := c.status.Load()
+	return s.code, Status[s.code], s.reason
 }
 
-// SetStatus sets the current state of the collector to one
-// of the values defined by CollectorStatus
-func (c *AbstractCollector) SetStatus(status uint8, msg string) {
-	if status >= uint8(len(Status)) {
-		panic("invalid status code " + strconv.FormatUint(uint64(status), 10))
+// SetStatus atomically sets the current state of the collector to one
+// of the values defined by CollectorStatus, with its matching reason
+func (c *AbstractCollector) SetStatus(code uint8, msg string) {
+	if code >= uint8(len(Status)) {
+		panic("invalid status code " + strconv.FormatUint(uint64(code), 10))
 	}
-	c.Status = status
-	c.Message = msg
+	c.status.Store(&collectorStatus{code: code, reason: msg})
 }
 
 // GetParams returns the parameters of the collector
@@ -758,9 +788,11 @@ func (c *AbstractCollector) SetMatrix(m map[string]*matrix.Matrix) {
 	c.Matrix = m
 }
 
-// SetMetadata set the metadata Matrix m as a field of the collector
+// SetMetadata sets the metadata Matrix m as a field of the collector and
+// publishes an independent initial snapshot before the collector starts mutating it
 func (c *AbstractCollector) SetMetadata(m *matrix.Matrix) {
 	c.Metadata = m
+	c.metadataSnap.Store(m.Clone())
 }
 
 // WantedExporters returns the list of exporters the receiver will export data to

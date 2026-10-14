@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 )
 
 // Exporter defines the required attributes of an exporter
@@ -24,18 +25,24 @@ type Exporter interface {
 	GetClass() string // the class of the exporter, e.g. Prometheus, InfluxDB
 	// GetName is different from Class, since we can have multiple instances of the same Class
 	GetName() string                      // the name of the exporter instance
-	GetExportCount() uint64               // return and reset number of exported data points, used by Poller to keep stats
-	AddExportCount(uint64)                // add count to the export count, called by the exporter itself
+	GetExportedTotal() uint64             // cumulative number of data points exported since start
+	AddExportCount(uint64)                // add count to the exported total, called by the exporter itself
 	GetStatus() (uint8, string, string)   // return current state of the exporter
 	Export(*matrix.Matrix) (Stats, error) // render data in matrix to the desired format and emit
 	// this is the only function that should be implemented by "real" exporters
 }
 
-// status defines the possible states of an exporter
-var status = [3]string{
+// statusName defines the possible states of an exporter
+var statusName = [3]string{
 	"up",
 	"standby",
 	"failed",
+}
+
+// exporterStatus is the atomically published state of an exporter
+type exporterStatus struct {
+	code   uint8
+	reason string
 }
 
 // Stats capture the number of instances and metrics exported
@@ -51,14 +58,19 @@ type AbstractExporter struct {
 	Class       string
 	Name        string
 	Logger      *slog.Logger
-	Status      uint8
-	Message     string
 	Options     *options.Options
 	Params      conf.Exporter
 	Metadata    *matrix.Matrix // metadata about the export
 	*sync.Mutex                // mutex to block exporter during export
-	exportCount uint64         // atomic
-	countMux    *sync.Mutex
+
+	// status is the atomically published state: code and reason are read/written as one
+	// value, so a concurrent reader always sees a status code with its matching reason
+	status atomic.Pointer[exporterStatus]
+
+	// exportedTotal is the cumulative number of emitted data points since start.
+	// Per-generation deltas are computed by the poller against the previous generation,
+	// so publishing never mutates producer state and each count is attributed exactly once
+	exportedTotal atomic.Uint64
 }
 
 // New creates an AbstractExporter instance with the given arguments:
@@ -74,9 +86,9 @@ func New(c, n string, o *options.Options, p conf.Exporter, params *conf.Poller) 
 		Params:   p,
 		Logger:   slog.Default().With(slog.String("exporter", n)),
 		Mutex:    &sync.Mutex{},
-		countMux: &sync.Mutex{},
 		Metadata: matrix.New(n, "metadata_exporter", "metadata_exporter"),
 	}
+	abc.status.Store(&exporterStatus{})
 	if params != nil {
 		abc.Metadata.SetGlobalLabel("datacenter", params.Datacenter)
 		labels := params.Labels
@@ -130,36 +142,31 @@ func (e *AbstractExporter) GetName() string {
 	return e.Name
 }
 
-// GetExportCount reports and resets count of exported data points "atomically"
-// this and next methods are only to report the poller
-// how much data we have exported (independent of poll/export interval)
-func (e *AbstractExporter) GetExportCount() uint64 {
-	e.countMux.Lock()
-	count := e.exportCount
-	e.exportCount = 0
-	e.countMux.Unlock()
-	return count
+// GetExportedTotal returns the cumulative count of data points emitted since start.
+// The poller derives the per-generation count as the delta against the previous generation,
+// so reading never resets or mutates producer state and each count is attributed exactly once
+func (e *AbstractExporter) GetExportedTotal() uint64 {
+	return e.exportedTotal.Load()
 }
 
-// AddExportCount adds count n to the export counter
+// AddExportCount adds n to the cumulative exported total
 func (e *AbstractExporter) AddExportCount(n uint64) {
-	e.countMux.Lock()
-	e.exportCount += n
-	e.countMux.Unlock()
+	e.exportedTotal.Add(n)
 }
 
-// GetStatus returns current state of exporter
+// GetStatus returns the current state of the exporter. The returned code and reason
+// always come from the same atomic state, so they never mismatch.
 func (e *AbstractExporter) GetStatus() (uint8, string, string) {
-	return e.Status, status[e.Status], e.Message
+	s := e.status.Load()
+	return s.code, statusName[s.code], s.reason
 }
 
-// SetStatus sets the current state of exporter
+// SetStatus atomically sets the current state of the exporter, with its matching reason
 func (e *AbstractExporter) SetStatus(code uint8, msg string) {
-	if code >= uint8(len(status)) {
+	if code >= uint8(len(statusName)) {
 		panic("invalid status code " + strconv.FormatUint(uint64(code), 10))
 	}
-	e.Status = code
-	e.Message = msg
+	e.status.Store(&exporterStatus{code: code, reason: msg})
 }
 
 // @TODO: implement!

@@ -560,8 +560,8 @@ func (s *StorageGrid) CollectAutoSupport(p *collector.Payload) {
 		}
 	}
 
-	// Add collector information
-	md := s.GetMetadata()
+	// Add collector information from the same published generation
+	md := p.CollectorMetadata(s.Name + "." + s.Object)
 	info := collector.InstanceInfoFromMetadata(md)
 
 	p.AddCollectorAsup(collector.AsupCollector{
