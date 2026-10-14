@@ -2,11 +2,8 @@ package collector
 
 import (
 	"cmp"
-	"context"
 	"crypto/sha1" //nolint:gosec // used for sha1sum not for security
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/netapp/harvest/v2/cmd/harvest/version"
 	"github.com/netapp/harvest/v2/pkg/conf"
@@ -18,8 +15,6 @@ import (
 	"github.com/netapp/harvest/v2/third_party/shirou/gopsutil/v4/process"
 	"log/slog"
 	"os"
-	"os/exec"
-	"path"
 	"runtime"
 	"slices"
 	"time"
@@ -34,7 +29,6 @@ type Payload struct {
 	Quotas     *InstanceInfo `json:"Quotas,omitempty"`
 	Tenants    *InstanceInfo `json:"Tenants,omitempty"`
 	Collectors *[]AsupCollector
-	path       string
 }
 
 type TargetInfo struct {
@@ -155,72 +149,10 @@ func (p *Payload) AddCollectorAsup(a AsupCollector) {
 	*p.Collectors = append(*p.Collectors, a)
 }
 
-func SendAutosupport(collectors []Collector, status *matrix.Matrix, pollerName string, maxRss uint64) error {
-
-	var (
-		msg *Payload
-		err error
-	)
-
-	if msg, err = BuildAndWriteAutoSupport(collectors, status, pollerName, maxRss); err != nil {
-		return fmt.Errorf("failed to build ASUP message poller:%s %w", pollerName, err)
-	}
-
-	if err = sendAsupMessage(msg); err != nil {
-		return fmt.Errorf("failed to send ASUP message poller:%s %w", pollerName, err)
-	}
-
-	return nil
-}
-
-// This function forks the autosupport binary
-func sendAsupMessage(msg *Payload) error {
-	err := sendAsupVia(msg, "./autosupport/asup")
-	if errors.Is(err, os.ErrNotExist) {
-		err = sendAsupVia(msg, "../harvest-private/harvest-asup/bin/asup")
-	}
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func sendAsupVia(msg *Payload, asupExecPath string) error {
-	asupTimeOutLimit := 10 * time.Second
-
-	// Invoke autosupport binary
-	cont, cancel := context.WithTimeout(context.Background(), asupTimeOutLimit)
-	defer cancel()
-	slog.Default().Info("Forking autosupport binary", slog.String("payloadPath", msg.path))
-
-	exitStatus := 0
-	err := exec.CommandContext(cont, asupExecPath, "--payload", msg.path, "--working-dir", workingDir).Run() //nolint:gosec
-	if err != nil {
-		var exitError *exec.ExitError
-		if ok := errors.Is(err, exitError); ok {
-			exitStatus = exitError.ExitCode()
-		}
-	}
-
-	// make sure to timeout after x minutes, kill that process
-	if errors.Is(cont.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("autosupport call to %s timed out:%w", asupExecPath, err)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	slog.Default().Info(
-		"Autosupport binary forked successfully",
-		slog.String("payloadPath", msg.path),
-		slog.Int("exitStatus", exitStatus),
-	)
-
-	return nil
-}
-
-func BuildAndWriteAutoSupport(collectors []Collector, status *matrix.Matrix, pollerName string, maxRss uint64) (*Payload, error) {
+// BuildAutoSupport assembles an autosupport payload from the poller's collectors
+// and status metadata. It does not write the payload or invoke the sidecar: the
+// AsupDeliverer is responsible for durably persisting and delivering the result.
+func BuildAutoSupport(collectors []Collector, status *matrix.Matrix, pollerName string, maxRss uint64) (*Payload, error) {
 
 	var (
 		msg          *Payload
@@ -307,39 +239,7 @@ func BuildAndWriteAutoSupport(collectors []Collector, status *matrix.Matrix, pol
 		MaxRssBytes:  max(maxRss, rssBytes),
 		EpochMilli:   time.Now().UnixMilli(),
 	}
-	payloadPath, err := writeAutoSupport(msg, pollerName)
-	if err != nil {
-		return nil, err
-	}
-	msg.path = payloadPath
 	return msg, nil
-}
-
-func writeAutoSupport(msg *Payload, pollerName string) (string, error) {
-	var (
-		payloadPath string
-		err         error
-	)
-
-	if payloadPath, err = getPayloadPath(workingDir, pollerName); err != nil {
-		return "", err
-	}
-
-	// name of the file: {poller_name}_payload.json
-	var perm os.FileMode = 0600
-	file, err := os.OpenFile(payloadPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
-	if err != nil {
-		return "", fmt.Errorf("autosupport failed to open payloadPath:%s %w", payloadPath, err)
-	}
-	defer func(file *os.File) {
-		_ = file.Close()
-	}(file)
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", " ")
-	if err = encoder.Encode(msg); err != nil {
-		return "", fmt.Errorf("autosupport failed to encode payloadPath:%s %w", payloadPath, err)
-	}
-	return payloadPath, nil
 }
 
 func attachMemory(msg *Payload) {
@@ -358,32 +258,6 @@ func getCPUInfo() (string, int) {
 
 func GetOSName() string {
 	return runtime.GOOS
-}
-
-// Gives asup payload json file path based on input.
-// Ex. asupDir = asup, pollerName = poller-1
-// o/p would be asup/payload/poller-1_payload.json
-func getPayloadPath(asupDir string, pollerName string) (string, error) {
-	payloadDir := path.Join(asupDir, "payload")
-
-	// name of the file: {poller_name}_payload.json
-	var perm os.FileMode = 0750
-	err := checkAndDeleteIfPermissionsMismatch(workingDir, perm)
-	if err != nil {
-		logging.Get().Warn("", slogx.Err(err))
-	}
-	err = checkAndDeleteIfPermissionsMismatch(payloadDir, perm)
-	if err != nil {
-		logging.Get().Warn("", slogx.Err(err))
-	}
-	// Create the asup payload directory if needed
-	if _, err := os.Stat(payloadDir); os.IsNotExist(err) {
-		if err = os.MkdirAll(payloadDir, perm); err != nil {
-			return "", fmt.Errorf("could not create asup payload directory %s: %w", payloadDir, err)
-		}
-	}
-
-	return path.Join(payloadDir, fmt.Sprintf("%s_%s", pollerName, "payload.json")), nil
 }
 
 func Sha1Sum(s string) string {

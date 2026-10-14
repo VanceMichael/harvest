@@ -151,6 +151,7 @@ type Poller struct {
 	startTime            time.Time
 	remote               conf.Remote
 	concurrentCollectors *atomic.Int32 // tracks the number of currently active collector tasks
+	asup                 *collector.AsupDeliverer
 }
 
 // Init starts Poller, reads parameters, opens zeroLog handler, initializes metadata,
@@ -407,25 +408,37 @@ func (p *Poller) Init() error {
 		logger.Info("Autosupport is disabled")
 	} else {
 		if p.collectorIsBuiltin() {
-			// Write the payload after asupFirstWrite.
-			// This is to examine the autosupport contents
-			// Nothing is sent, sending happens based on the asupSchedule
-			duration, err := time.ParseDuration(asupFirstWrite)
+			// Recover any unacknowledged payloads from earlier runs before
+			// scheduling new triggers.
+			deliverer, err := collector.NewAsupDeliverer(p.name)
 			if err != nil {
 				logger.Error(
-					"Failed to write first autosupport payload.",
+					"Failed to initialize autosupport outbox, autosupport is disabled for this session",
 					slogx.Err(err),
-					slog.String("asupFirstWrite", asupFirstWrite),
+					slog.String("poller", p.name),
 				)
 			} else {
-				time.AfterFunc(duration, func() {
-					p.firstAutoSupport()
-				})
+				p.asup = deliverer
+				// Write the payload after asupFirstWrite.
+				// This is to examine the autosupport contents
+				// Nothing is sent, sending happens based on the asupSchedule
+				duration, err := time.ParseDuration(asupFirstWrite)
+				if err != nil {
+					logger.Error(
+						"Failed to write first autosupport payload.",
+						slogx.Err(err),
+						slog.String("asupFirstWrite", asupFirstWrite),
+					)
+				} else {
+					time.AfterFunc(duration, func() {
+						p.firstAutoSupport()
+					})
+				}
+				if err := p.schedule.NewTaskString("asup", asupSchedule, 0, p.startAsup, p.options.Asup, "asup_"+p.name); err != nil {
+					return err
+				}
+				logger.Info("Autosupport scheduled", slog.String("asupSchedule", asupSchedule))
 			}
-			if err := p.schedule.NewTaskString("asup", asupSchedule, 0, p.startAsup, p.options.Asup, "asup_"+p.name); err != nil {
-				return err
-			}
-			logger.Info("Autosupport scheduled", slog.String("asupSchedule", asupSchedule))
 		} else {
 			logger.Info(
 				`Autosupport disabled since poller not connected to ONTAP.`,
@@ -495,10 +508,13 @@ func specialCaseQtree(objectsToCollectors map[string][]objectCollector) {
 }
 
 func (p *Poller) firstAutoSupport() {
-	if p.collectors == nil {
+	if p.asup == nil || p.collectors == nil {
 		return
 	}
-	if _, err := collector.BuildAndWriteAutoSupport(p.collectors, p.metadataTarget, p.name, p.maxRssBytes); err != nil {
+	// Write the payload so its contents can be examined. It is held out of
+	// delivery until the next scheduled send cycle.
+	err := p.asup.Enqueue(collector.TriggerFirstWrite, true, p.buildAutoSupport)
+	if err != nil {
 		slog.Error(
 			"First autosupport failed",
 			slogx.Err(err),
@@ -508,17 +524,24 @@ func (p *Poller) firstAutoSupport() {
 }
 
 func (p *Poller) startAsup() (map[string]*matrix.Matrix, error) {
-	if p.collectors != nil {
-		if err := collector.SendAutosupport(p.collectors, p.metadataTarget, p.name, p.maxRssBytes); err != nil {
-			slog.Error(
-				"Start autosupport failed.",
-				slogx.Err(err),
-				slog.String("poller", p.name),
-			)
-			return nil, err
-		}
+	if p.asup == nil || p.collectors == nil {
+		return nil, nil
+	}
+	// Admit the held first-write payload, enqueue a fresh payload and deliver
+	// everything that is due, including payloads recovered after a restart.
+	if err := p.asup.SendDue(collector.TriggerSchedule, p.buildAutoSupport); err != nil {
+		slog.Error(
+			"Start autosupport failed.",
+			slogx.Err(err),
+			slog.String("poller", p.name),
+		)
+		return nil, err
 	}
 	return nil, nil
+}
+
+func (p *Poller) buildAutoSupport() (*collector.Payload, error) {
+	return collector.BuildAutoSupport(p.collectors, p.metadataTarget, p.name, p.maxRssBytes)
 }
 
 // Start will run the collectors and the poller itself
