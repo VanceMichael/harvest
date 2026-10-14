@@ -544,7 +544,13 @@ func (c *AbstractCollector) Start(
 		exporterStats := exporter.Stats{}
 
 		for _, e := range c.Exporters {
-			if code, status, reason := e.GetStatus(); code != 0 {
+			if code, status, reason := e.GetStatus(); code == 2 {
+				// Only a hard "failed" state (e.g. broken delivery spool)
+				// skips export. Push exporters in backlogged (3), retrying
+				// (4) or rejected (5) delivery states must keep accepting
+				// snapshots: batches are spooled locally without contacting
+				// the remote, and enqueuing is what lets the backlog drain
+				// and the exporter recover to up.
 				c.Logger.Warn(
 					"skip export",
 					slog.String("exporter", e.GetName()),

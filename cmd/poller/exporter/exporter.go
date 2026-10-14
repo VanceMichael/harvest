@@ -32,10 +32,19 @@ type Exporter interface {
 }
 
 // status defines the possible states of an exporter
-var status = [3]string{
+//
+// The first three codes are the lifecycle states shared with collectors:
+// up (0), standby (1), failed (2). Push exporters additionally publish
+// delivery states while their background sender is working through a
+// durable backlog: backlogged (3), retrying (4), rejected (5). None of the
+// delivery states blocks ingestion of new snapshots.
+var status = [6]string{
 	"up",
 	"standby",
 	"failed",
+	"backlogged",
+	"retrying",
+	"rejected",
 }
 
 // Stats capture the number of instances and metrics exported
@@ -57,6 +66,7 @@ type AbstractExporter struct {
 	Params      conf.Exporter
 	Metadata    *matrix.Matrix // metadata about the export
 	*sync.Mutex                // mutex to block exporter during export
+	statusMux   sync.Mutex     // protects Status/Message, updated asynchronously by delivery senders
 	exportCount uint64         // atomic
 	countMux    *sync.Mutex
 }
@@ -102,6 +112,13 @@ func (e *AbstractExporter) InitAbc() error {
 	}
 	if _, err := e.Metadata.NewMetricUint64("count"); err != nil {
 		return err
+	}
+
+	// durable push pipeline counters (unused by pull exporters)
+	for _, metric := range []string{"delivery_pending", "delivery_retries", "delivery_rejected"} {
+		if _, err := e.Metadata.NewMetricUint64(metric); err != nil {
+			return err
+		}
 	}
 
 	if instance, err := e.Metadata.NewInstance("export"); err == nil {
@@ -150,6 +167,8 @@ func (e *AbstractExporter) AddExportCount(n uint64) {
 
 // GetStatus returns current state of exporter
 func (e *AbstractExporter) GetStatus() (uint8, string, string) {
+	e.statusMux.Lock()
+	defer e.statusMux.Unlock()
 	return e.Status, status[e.Status], e.Message
 }
 
@@ -158,8 +177,22 @@ func (e *AbstractExporter) SetStatus(code uint8, msg string) {
 	if code >= uint8(len(status)) {
 		panic("invalid status code " + strconv.FormatUint(uint64(code), 10))
 	}
+	e.statusMux.Lock()
 	e.Status = code
 	e.Message = msg
+	e.statusMux.Unlock()
+}
+
+// SetDeliveryStats writes durable push pipeline counters into the exporter
+// metadata. No-op for pull exporters.
+func (e *AbstractExporter) SetDeliveryStats(pending, retries, rejected uint64) {
+	inst := e.Metadata.GetInstance("export")
+	if inst == nil {
+		return
+	}
+	e.Metadata.MustSetValueUint64("delivery_pending", inst, pending)
+	e.Metadata.MustSetValueUint64("delivery_retries", inst, retries)
+	e.Metadata.MustSetValueUint64("delivery_rejected", inst, rejected)
 }
 
 // @TODO: implement!

@@ -794,6 +794,29 @@ type DiskCacheConfig struct {
 	Path string `yaml:"path"`
 }
 
+// DeliveryConfig configures the durable push pipeline used by push exporters
+// (InfluxDB, VictoriaMetrics). Rendered batches are spooled to disk before
+// they are acknowledged by the remote, so a timeout, 5xx or process restart
+// cannot silently drop a collection round.
+type DeliveryConfig struct {
+	// SpoolPath is the directory under which one sub-directory per poller/
+	// exporter is created. Defaults to <harvest-home>/spool when empty.
+	SpoolPath string `yaml:"spool_path,omitempty"`
+	// QueueMax bounds how many unacknowledged batch payloads are held in
+	// memory. Batches beyond the window remain on disk and are loaded when
+	// they reach the head of the queue. Defaults to 256.
+	QueueMax *int `yaml:"queue_max,omitempty"`
+	// SpoolMaxBatches bounds the total number of unacknowledged batches on
+	// disk. New batches are refused (export fails with an observable error)
+	// once the limit is reached. Defaults to 10000.
+	SpoolMaxBatches *int `yaml:"spool_max_batches,omitempty"`
+	// RetryMinInterval is the backoff of the first retry of a batch.
+	// Defaults to 1s.
+	RetryMinInterval string `yaml:"retry_min_interval,omitempty"`
+	// RetryMaxInterval caps the exponential backoff. Defaults to 5m.
+	RetryMaxInterval string `yaml:"retry_max_interval,omitempty"`
+}
+
 type Exporter struct {
 	Port              *int      `yaml:"port,omitempty"`
 	PortRange         *IntRange `yaml:"port_range,omitempty"`
@@ -820,6 +843,7 @@ type Exporter struct {
 	ClientTimeout *string          `yaml:"client_timeout,omitempty"`
 	Version       *string          `yaml:"version,omitempty"`
 	DiskCache     *DiskCacheConfig `yaml:"disk_cache,omitempty"`
+	Delivery      *DeliveryConfig  `yaml:"delivery,omitempty"`
 
 	IsTest     bool `yaml:"-"` // true when run from unit tests
 	IsEmbedded bool `yaml:"-"` // true when the exporter is embedded in a poller

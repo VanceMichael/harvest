@@ -33,6 +33,41 @@ When using `url`, the `addr` and `port` field will be ignored.
 | `client_timeout` | int, optional                | client timeout in seconds                                                                          | `5`     |
 | `sort_labels`    | bool, optional               | always emits metric labels in a deterministic order for this exporter. VictoriaMetrics requires this — without it, VictoriaMetrics will mark series stale if label order changes between polls. Setting `sort_labels: false` is ignored (with a logged warning), since it is never safe for VictoriaMetrics. | `true` (always)                      |
 
+### Durable delivery
+
+Rendered batches are spooled to disk before they are acknowledged by VictoriaMetrics and are removed only after a
+successful write. Network failures, timeouts and server errors (HTTP 408/429/5xx) are retried in FIFO order with
+deterministic exponential backoff, so a temporary outage no longer loses a collection round. Other 4xx errors are not
+retried: the batch is moved to `<spool_path>/rejected/` and the exporter status becomes `rejected`. After recovery the
+oldest batches are delivered before new snapshots. Each exporter instance has its own spool and sender goroutine; a
+slow VictoriaMetrics never blocks other exporters, collectors or the poller schedule.
+
+Exporter status, as visible in poller metadata (`metadata_component`), is one of: `up`, `backlogged` (batches queued),
+`retrying` (head batch being retried), `rejected` (permanent 4xx on the latest batch) and `failed` (local spool
+problem or backlog limit reached).
+
+The optional `delivery` section tunes the pipeline (all fields optional):
+
+| parameter                          | type          | description                                                                          | default        |
+|------------------------------------|---------------|--------------------------------------------------------------------------------------|----------------|
+| `delivery.spool_path`              | string        | base directory for per-poller/exporter spool sub-directories                        | `<harvest-home>/spool` |
+| `delivery.queue_max`               | int           | unacknowledged batch payloads held in memory; overflow stays on disk                | `256`          |
+| `delivery.spool_max_batches`       | int           | hard limit of unacknowledged batches on disk; new snapshots are refused past it     | `10000`        |
+| `delivery.retry_min_interval`      | duration      | backoff of the first retry (`1s`, `500ms`, ...)                                     | `1s`           |
+| `delivery.retry_max_interval`      | duration      | cap of the exponential backoff                                                      | `5m`           |
+
+```yaml
+Exporters:
+  my_victoriametrics:
+    exporter: VictoriaMetrics
+    addr: localhost
+    delivery:
+      spool_path: /var/spool/harvest
+      spool_max_batches: 20000
+      retry_min_interval: 2s
+      retry_max_interval: 10m
+```
+
 ### Example
 
 snippet from `harvest.yml` using `addr`: (supports HTTP only))

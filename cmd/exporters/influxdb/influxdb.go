@@ -6,13 +6,14 @@ package influxdb
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"github.com/netapp/harvest/v2/cmd/poller/exporter"
+	"github.com/netapp/harvest/v2/cmd/poller/exporter/delivery"
 	"github.com/netapp/harvest/v2/pkg/errs"
 	"github.com/netapp/harvest/v2/pkg/matrix"
 	"github.com/netapp/harvest/v2/pkg/requests"
 	"github.com/netapp/harvest/v2/pkg/slogx"
-	"io"
 	"log/slog"
 	"net/http"
 	url2 "net/url"
@@ -31,11 +32,10 @@ import (
 */
 
 const (
-	defaultPort          = 8086
-	defaultTimeout       = 5
-	defaultAPIVersion    = "2"
-	defaultAPIPrecision  = "s"
-	expectedResponseCode = 204
+	defaultPort         = 8086
+	defaultTimeout      = 5
+	defaultAPIVersion   = "2"
+	defaultAPIPrecision = "s"
 )
 
 // some field names that we need to avoid
@@ -55,6 +55,7 @@ type InfluxDB struct {
 	client *http.Client
 	url    string
 	token  string
+	queue  *delivery.Queue
 }
 
 func New(abc *exporter.AbstractExporter) exporter.Exporter {
@@ -145,6 +146,18 @@ func (e *InfluxDB) Init() error {
 	// construct HTTP client
 	e.client = &http.Client{Timeout: timeout}
 
+	// In test mode Export only renders metrics, no spool or sender needed.
+	if !e.Options.IsTest {
+		queue, err := delivery.Configure(
+			e.Options.Poller, e.Class, e.Name, e.Params.Delivery, e.Logger, e.push, e.SetStatus,
+		)
+		if err != nil {
+			return err
+		}
+		e.queue = queue
+		queue.Start()
+	}
+
 	return nil
 }
 
@@ -169,9 +182,11 @@ func (e *InfluxDB) Export(data *matrix.Matrix) (exporter.Stats, error) {
 		// in test mode, don't emit metrics
 		if e.Options.IsTest {
 			return stats, nil
-			// otherwise, to the actual export: send to the DB
-		} else if err = e.Emit(metrics); err != nil {
-			return stats, fmt.Errorf("unable to emit object: %s, uuid: %s, err=%w", data.Object, data.UUID, err)
+		}
+		// spool the snapshot: it is sent and retried by the per-exporter
+		// delivery goroutine and survives remote outages/restarts
+		if err = e.enqueue(metrics, data); err != nil {
+			return stats, fmt.Errorf("unable to queue object: %s, uuid: %s, err=%w", data.Object, data.UUID, err)
 		}
 	}
 
@@ -185,42 +200,48 @@ func (e *InfluxDB) Export(data *matrix.Matrix) (exporter.Stats, error) {
 	// update metadata
 	e.Metadata.MustSetValueInt64("time", e.Metadata.MustGetInstance("export"), time.Since(s).Microseconds())
 
-	if metrics, stats, err = e.Render(e.Metadata); err != nil {
+	if e.Options.IsTest {
+		return stats, nil
+	}
+
+	// publish pipeline state with the exporter metadata batch
+	e.updateDeliveryStats()
+	if metrics, _, err = e.Render(e.Metadata); err != nil {
 		e.Logger.Error("render metadata", slogx.Err(err))
-	} else if err = e.Emit(metrics); err != nil {
-		e.Logger.Error("emit metadata", slogx.Err(err))
+	} else if err = e.enqueue(metrics, e.Metadata); err != nil {
+		e.Logger.Error("queue metadata", slogx.Err(err))
 	}
 
 	return stats, nil
 }
 
-func (e *InfluxDB) Emit(data [][]byte) error {
-	var buffer *bytes.Buffer
-	var request *http.Request
-	var response *http.Response
-	var err error
+// enqueue durably queues one rendered matrix. Enqueue never performs a
+// remote call, so a slow InfluxDB cannot block the collector or any other
+// exporter.
+func (e *InfluxDB) enqueue(metrics [][]byte, data *matrix.Matrix) error {
+	if len(metrics) == 0 {
+		return nil
+	}
+	return e.queue.Enqueue(bytes.Join(metrics, []byte("\n")), data.Object+"/"+data.UUID)
+}
 
-	buffer = bytes.NewBuffer(bytes.Join(data, []byte("\n")))
+func (e *InfluxDB) updateDeliveryStats() {
+	snap := e.queue.Snapshot()
+	e.SetDeliveryStats(uint64(snap.Pending), snap.Retries, snap.Rejected)
+}
 
-	if request, err = requests.New("POST", e.url, buffer); err != nil {
-		return err
+// push performs one delivery attempt of a spooled batch. It runs on the
+// queue's single sender goroutine, never on a collector/poller goroutine.
+func (e *InfluxDB) push(ctx context.Context, batchID uint64, payload []byte) error {
+	request, err := requests.New("POST", e.url, bytes.NewReader(payload))
+	if err != nil {
+		return delivery.RetryableError(err)
 	}
 
 	request.Header.Set("Authorization", "Token "+e.token)
+	request.Header.Set(delivery.BatchHeader, strconv.FormatUint(batchID, 10))
 
-	if response, err = e.client.Do(request); err != nil {
-		return err
-	}
-	//goland:noinspection GoUnhandledErrorResult
-	defer response.Body.Close()
-	if response.StatusCode != expectedResponseCode {
-		body, err := io.ReadAll(response.Body)
-		if err != nil {
-			return errs.New(errs.ErrAPIResponse, err.Error())
-		}
-		return fmt.Errorf("%w: %s", errs.ErrAPIRequestRejected, string(body))
-	}
-	return nil
+	return delivery.Do(ctx, e.client, request)
 }
 
 func (e *InfluxDB) Render(data *matrix.Matrix) ([][]byte, exporter.Stats, error) {

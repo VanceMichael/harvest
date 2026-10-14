@@ -2,28 +2,27 @@ package victoriametrics
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"github.com/netapp/harvest/v2/cmd/exporters"
 	"github.com/netapp/harvest/v2/cmd/poller/exporter"
+	"github.com/netapp/harvest/v2/cmd/poller/exporter/delivery"
 	"github.com/netapp/harvest/v2/pkg/errs"
 	"github.com/netapp/harvest/v2/pkg/matrix"
 	"github.com/netapp/harvest/v2/pkg/requests"
 	"github.com/netapp/harvest/v2/pkg/slogx"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
 const (
-	defaultPort          = 8428
-	defaultTimeout       = 5
-	defaultAPIVersion    = "1"
-	globalPrefix         = ""
-	expectedResponseCode = 204
+	defaultPort       = 8428
+	defaultTimeout    = 5
+	defaultAPIVersion = "1"
+	globalPrefix      = ""
 )
 
 type VictoriaMetrics struct {
@@ -33,7 +32,7 @@ type VictoriaMetrics struct {
 	addMetaTags  bool
 	sortLabels   bool
 	globalPrefix string
-	bufferPool   *sync.Pool
+	queue        *delivery.Queue
 }
 
 func New(abc *exporter.AbstractExporter) exporter.Exporter {
@@ -44,13 +43,6 @@ func (v *VictoriaMetrics) Init() error {
 
 	if err := v.InitAbc(); err != nil {
 		return err
-	}
-
-	// Initialize buffer pool
-	v.bufferPool = &sync.Pool{
-		New: func() any {
-			return new(bytes.Buffer)
-		},
 	}
 
 	var (
@@ -138,6 +130,18 @@ func (v *VictoriaMetrics) Init() error {
 	// construct HTTP client
 	v.client = &http.Client{Timeout: timeout}
 
+	// In test mode Export only renders metrics, no spool or sender needed.
+	if !v.Options.IsTest {
+		queue, err := delivery.Configure(
+			v.Options.Poller, v.Class, v.Name, v.Params.Delivery, v.Logger, v.push, v.SetStatus,
+		)
+		if err != nil {
+			return err
+		}
+		v.queue = queue
+		queue.Start()
+	}
+
 	return nil
 }
 
@@ -166,9 +170,11 @@ func (v *VictoriaMetrics) Export(data *matrix.Matrix) (exporter.Stats, error) {
 	// in test mode, don't emit metrics
 	if v.Options.IsTest {
 		return stats, nil
-		// otherwise, to the actual export: send to the DB
-	} else if err = v.Emit(metrics); err != nil {
-		return stats, fmt.Errorf("unable to emit object: %s, uuid: %s, err=%w", data.Object, data.UUID, err)
+	}
+	// spool the snapshot: it is sent and retried by the per-exporter
+	// delivery goroutine and survives remote outages/restarts
+	if err = v.enqueue(metrics, data); err != nil {
+		return stats, fmt.Errorf("unable to queue object: %s, uuid: %s, err=%w", data.Object, data.UUID, err)
 	}
 
 	v.Logger.Debug(
@@ -181,43 +187,42 @@ func (v *VictoriaMetrics) Export(data *matrix.Matrix) (exporter.Stats, error) {
 	// update metadata
 	v.Metadata.MustSetValueInt64("time", v.Metadata.MustGetInstance("export"), time.Since(s).Microseconds())
 
+	// publish pipeline state with the exporter metadata batch
+	v.updateDeliveryStats()
+
 	// render metadata metrics into open metrics format with timestamp
-	metrics, stats, _ = exporters.Render(v.Metadata, v.addMetaTags, v.sortLabels, v.globalPrefix, v.Logger, timestamp)
-	if err = v.Emit(metrics); err != nil {
-		v.Logger.Error("emit metadata", slogx.Err(err))
+	metrics, _, _ = exporters.Render(v.Metadata, v.addMetaTags, v.sortLabels, v.globalPrefix, v.Logger, timestamp)
+	if err = v.enqueue(metrics, v.Metadata); err != nil {
+		v.Logger.Error("queue metadata", slogx.Err(err))
 	}
 
 	return stats, nil
 }
 
-func (v *VictoriaMetrics) Emit(data [][]byte) error {
-	var buffer *bytes.Buffer
-	var request *http.Request
-	var response *http.Response
-	var err error
+// enqueue durably queues one rendered matrix. Enqueue never performs a
+// remote call, so a slow VictoriaMetrics cannot block the collector or any
+// other exporter.
+func (v *VictoriaMetrics) enqueue(metrics [][]byte, data *matrix.Matrix) error {
+	if len(metrics) == 0 {
+		return nil
+	}
+	return v.queue.Enqueue(bytes.Join(metrics, []byte("\n")), data.Object+"/"+data.UUID)
+}
 
-	buffer = v.bufferPool.Get().(*bytes.Buffer)
-	buffer.Reset()
-	_, _ = buffer.Write(bytes.Join(data, []byte("\n")))
+func (v *VictoriaMetrics) updateDeliveryStats() {
+	snap := v.queue.Snapshot()
+	v.SetDeliveryStats(uint64(snap.Pending), snap.Retries, snap.Rejected)
+}
 
-	defer v.bufferPool.Put(buffer)
-
-	if request, err = requests.New("POST", v.url, buffer); err != nil {
-		return err
+// push performs one delivery attempt of a spooled batch. It runs on the
+// queue's single sender goroutine, never on a collector/poller goroutine.
+func (v *VictoriaMetrics) push(ctx context.Context, batchID uint64, payload []byte) error {
+	request, err := requests.New("POST", v.url, bytes.NewReader(payload))
+	if err != nil {
+		return delivery.RetryableError(err)
 	}
 
-	if response, err = v.client.Do(request); err != nil {
-		return err
-	}
+	request.Header.Set(delivery.BatchHeader, strconv.FormatUint(batchID, 10))
 
-	//goland:noinspection GoUnhandledErrorResult
-	defer response.Body.Close()
-	if response.StatusCode != expectedResponseCode {
-		body, err := io.ReadAll(response.Body)
-		if err != nil {
-			return errs.New(errs.ErrAPIResponse, err.Error())
-		}
-		return fmt.Errorf("%w: %s", errs.ErrAPIRequestRejected, string(body))
-	}
-	return nil
+	return delivery.Do(ctx, v.client, request)
 }
